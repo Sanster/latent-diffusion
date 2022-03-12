@@ -78,7 +78,7 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     """
 
     def forward(self, x, emb, context=None):
-        for layer in self:
+        for i, layer in enumerate(self):
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
             elif isinstance(layer, SpatialTransformer):
@@ -107,7 +107,7 @@ class Upsample(nn.Module):
             self.conv = conv_nd(dims, self.channels, self.out_channels, 3, padding=padding)
 
     def forward(self, x):
-        assert x.shape[1] == self.channels
+        # assert x.shape[1] == self.channels
         if self.dims == 3:
             x = F.interpolate(
                 x, (x.shape[2], x.shape[3] * 2, x.shape[4] * 2), mode="nearest"
@@ -156,7 +156,7 @@ class Downsample(nn.Module):
             self.op = avg_pool_nd(dims, kernel_size=stride, stride=stride)
 
     def forward(self, x):
-        assert x.shape[1] == self.channels
+        # assert x.shape[1] == self.channels
         return self.op(x)
 
 
@@ -247,9 +247,10 @@ class ResBlock(TimestepBlock):
         :param emb: an [N x emb_channels] Tensor of timestep embeddings.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
-        )
+        return self._forward(x, emb)
+        # return checkpoint(
+        #     self._forward, (x, emb), self.parameters(), self.use_checkpoint
+        # )
 
 
     def _forward(self, x, emb):
@@ -261,7 +262,7 @@ class ResBlock(TimestepBlock):
             h = in_conv(h)
         else:
             h = self.in_layers(x)
-        emb_out = self.emb_layers(emb).type(h.dtype)
+        emb_out = self.emb_layers(emb)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
         if self.use_scale_shift_norm:
@@ -312,7 +313,8 @@ class AttentionBlock(nn.Module):
         self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
 
     def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
+        return self._forward(x)
+        # return checkpoint(self._forward, (x,), self.parameters(), True)   # TODO: check checkpoint usage, is True # TODO: fix the .half call!!!
         #return pt_checkpoint(self._forward, x)  # pytorch
 
     def _forward(self, x):
@@ -321,7 +323,8 @@ class AttentionBlock(nn.Module):
         qkv = self.qkv(self.norm(x))
         h = self.attention(qkv)
         h = self.proj_out(h)
-        return (x + h).reshape(b, c, *spatial)
+        res = (x + h).reshape(b, c, *spatial)
+        return res
 
 
 def count_flops_attn(model, _x, y):
@@ -360,14 +363,14 @@ class QKVAttentionLegacy(nn.Module):
         :return: an [N x (H * C) x T] tensor after attention.
         """
         bs, width, length = qkv.shape
-        assert width % (3 * self.n_heads) == 0
+        # assert width % (3 * self.n_heads) == 0
         ch = width // (3 * self.n_heads)
         q, k, v = qkv.reshape(bs * self.n_heads, ch * 3, length).split(ch, dim=1)
         scale = 1 / math.sqrt(math.sqrt(ch))
         weight = th.einsum(
             "bct,bcs->bts", q * scale, k * scale
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = th.softmax(weight.float(), dim=-1)
         a = th.einsum("bts,bcs->bct", weight, v)
         return a.reshape(bs, -1, length)
 
@@ -401,7 +404,7 @@ class QKVAttention(nn.Module):
             (q * scale).view(bs * self.n_heads, ch, length),
             (k * scale).view(bs * self.n_heads, ch, length),
         )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
+        weight = th.softmax(weight.float(), dim=-1)
         a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
         return a.reshape(bs, -1, length)
 
@@ -688,27 +691,30 @@ class UNetModel(nn.Module):
         :param y: an [N] Tensor of labels, if class-conditional.
         :return: an [N x C x ...] Tensor of outputs.
         """
-        assert (y is not None) == (
-            self.num_classes is not None
-        ), "must specify y if and only if the model is class-conditional"
-        assert timesteps is not None, 'need to implement no-timestep usage'
+        # assert (y is not None) == (
+        #     self.num_classes is not None
+        # ), "must specify y if and only if the model is class-conditional"
+        # assert timesteps is not None, 'need to implement no-timestep usage'
         hs = []
-        t_emb = timestep_embedding(timesteps, self.model_channels, repeat_only=False)
-        emb = self.time_embed(t_emb)
+        # t_emb = timestep_embedding(x.device, timesteps, self.model_channels, repeat_only=False).to(x.device)
+        # emb = self.time_embed(t_emb)
+        emb = self.time_embed(timesteps)
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
 
-        h = x.type(self.dtype)
-        for module in self.input_blocks:
+        # h = x.type(self.dtype).to(x.device)
+        h = x
+        for i, module in enumerate(self.input_blocks):
             h = module(h, emb, context)
             hs.append(h)
         h = self.middle_block(h, emb, context)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb, context)
-        h = h.type(x.dtype)
+
+        # h = h.type(x.dtype)
         if self.predict_codebook_ids:
             #return self.out(h), self.id_predictor(h)
             return self.id_predictor(h)
@@ -917,10 +923,10 @@ class EncoderUNetModel(nn.Module):
         :param timesteps: a 1-D batch of timesteps.
         :return: an [N x K] Tensor of outputs.
         """
-        emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+        emb = self.time_embed(timestep_embedding(x.device, timesteps, self.model_channels).to(x.device))
 
         results = []
-        h = x.type(self.dtype)
+        # h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
             if self.pool.startswith("spatial"):
@@ -931,6 +937,6 @@ class EncoderUNetModel(nn.Module):
             h = th.cat(results, axis=-1)
             return self.out(h)
         else:
-            h = h.type(x.dtype)
+            # h = h.type(x.dtype)
             return self.out(h)
 
